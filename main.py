@@ -1,7 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import joblib
 import numpy as np
+import pandas as pd
 
 app = FastAPI()
 
@@ -9,6 +10,9 @@ app = FastAPI()
 classification_model = joblib.load("ai_model.pkl")
 rul_model = joblib.load("rul_model.pkl")
 metrics = joblib.load("metrics.pkl")
+
+# Column names matching what the model was trained on
+SENSOR_COLUMNS = [f"sensor_{i+1}" for i in range(21)]
 
 # Normal sensor ranges
 NORMAL_RANGES = {
@@ -80,22 +84,31 @@ def home():
 @app.post("/predict")
 def predict(input_data: SensorData):
 
-    # Convert input
-    features = np.array(input_data.data)
-    reshaped_features = features.reshape(1, -1)
+    # ✅ Validate input length
+    if len(input_data.data) != 21:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Expected 21 sensor values, got {len(input_data.data)}"
+        )
+
+    # ✅ Use DataFrame with column names — matches how the model was trained
+    df = pd.DataFrame([input_data.data], columns=SENSOR_COLUMNS)
 
     # Classification
-    prediction = int(classification_model.predict(reshaped_features)[0])
+    prediction = int(classification_model.predict(df)[0])
 
     # Risk label
     risk_label = RISK_LABELS.get(prediction, "Unknown")
 
     # Confidence
-    probs = classification_model.predict_proba(reshaped_features)[0]
+    probs = classification_model.predict_proba(df)[0]
     confidence = float(max(probs))
 
     # Predict RUL
-    rul = float(rul_model.predict(reshaped_features)[0])
+    rul = float(rul_model.predict(df)[0])
+
+    # Use raw array only for deviation calculation
+    features = np.array(input_data.data)
 
     # Find most abnormal sensor
     max_deviation = -1
@@ -105,9 +118,7 @@ def predict(input_data: SensorData):
     normal_max = None
 
     for i, value in enumerate(features):
-
         sensor_name = f"sensor_{i+1}"
-
         low, high = NORMAL_RANGES[sensor_name]
 
         if value < low:
@@ -139,35 +150,32 @@ def predict(input_data: SensorData):
 
     # Generate recommendation
     if prediction == 0:
-
         problem_sensor = None
         issue_type = None
-
         current_value = None
         normal_min = None
         normal_max = None
-
         work_order = (
             "Machine operating normally. "
             "Continue routine monitoring."
         )
 
     elif prediction == 1:
-
         work_order = (
             f"Warning: inspect {problem_sensor}. "
             f"Issue Type={issue_type}. "
             f"Reading={current_value:.2f}, "
-            f"Normal Range=({normal_min:.2f}-{normal_max:.2f})"
+            f"Normal Range=({normal_min:.2f}-{normal_max:.2f}). "
+            f"Estimated RUL: {rul:.0f} cycles."
         )
 
     else:
-
         work_order = (
             f"CRITICAL: inspect {problem_sensor} immediately. "
             f"Issue Type={issue_type}. "
             f"Reading={current_value:.2f}, "
-            f"Normal Range=({normal_min:.2f}-{normal_max:.2f})"
+            f"Normal Range=({normal_min:.2f}-{normal_max:.2f}). "
+            f"Estimated RUL: {rul:.0f} cycles."
         )
 
     return {
